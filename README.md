@@ -6,7 +6,7 @@
 
 예시 문제: [#3006번 · 수 맞히기 (업다운)](http://10.122.0.73:8080/problems/3006)
 
-![](http://10.122.0.73/static/images/upload_2a0736eef8968a70866d.png)
+<img width="1917" height="1020" alt="Image" src="https://github.com/user-attachments/assets/f58674c8-3497-485a-bc9c-47aed1bce6f0" />
 
 ### 첨부파일
 
