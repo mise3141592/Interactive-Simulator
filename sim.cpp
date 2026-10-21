@@ -144,6 +144,7 @@ struct Engine {
     std::atomic<bool>  kill_flag{false};
     int                rc = -1;
     std::string        iact_err_msg;
+    int                timeout_sec = 10;   // configurable time limit
 
     // progress callback (called from worker thread, posted to main thread)
     std::function<void()> on_step;   // called after each step added
@@ -275,10 +276,13 @@ private:
 
         // 6. relay loop
         //    Two reader threads push into a shared queue; this thread relays.
+        // mq_ev: auto-reset event, fired whenever a message or iact-exit is posted
         struct Msg { int src; std::string line; bool eof; };
         std::queue<Msg> mq;
         std::mutex      mq_mtx;
-        HANDLE          mq_ev = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        HANDLE          mq_ev     = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        // iact_exit_ev: fired by watcher thread when iact process actually exits
+        HANDLE          iact_exit_ev = CreateEventW(nullptr, TRUE, FALSE, nullptr);
 
         auto reader = [&](HANDLE pipe_r, int src) {
             char buf[65536];
@@ -288,7 +292,6 @@ private:
                 bool ok = ReadFile(pipe_r, buf, sizeof(buf), &got, nullptr) && got > 0;
                 if (!ok) break;
                 leftover.append(buf, got);
-                // flush complete lines
                 size_t pos;
                 while ((pos = leftover.find('\n')) != std::string::npos) {
                     std::string line = leftover.substr(0, pos+1);
@@ -298,7 +301,6 @@ private:
                     SetEvent(mq_ev);
                 }
             }
-            // flush leftover without newline
             if (!leftover.empty()) {
                 { std::lock_guard<std::mutex> lk(mq_mtx);
                   mq.push({src, leftover, false}); }
@@ -309,17 +311,42 @@ private:
             SetEvent(mq_ev);
         };
 
+        // Watcher thread: blocks until iact process exits, then fires iact_exit_ev
+        std::thread t_iact_watch([&]{
+            WaitForSingleObject(p_iact.proc, INFINITE);
+            SetEvent(iact_exit_ev);
+            SetEvent(mq_ev);  // wake relay loop
+        });
+
         std::thread t_sol_r([&]{ reader(sol_stdout_p.r, 0); });
         std::thread t_iact_r([&]{ reader(iact_stdout_p.r, 1); });
 
         int  eof_count = 0;
-        bool timed_out = false;
-        DWORD deadline = GetTickCount() + 30000;
+        bool timed_out   = false;
+        bool iact_exited = false;
+        DWORD deadline = GetTickCount() + (DWORD)timeout_sec * 1000;
 
-        while (eof_count < 2 && !kill_flag) {
-            DWORD remaining = deadline - GetTickCount();
+        while (eof_count < 2 && !kill_flag && !iact_exited) {
+            DWORD now = GetTickCount();
+            DWORD remaining = deadline - now;
             if ((int)remaining <= 0) { timed_out = true; break; }
             WaitForSingleObject(mq_ev, min(remaining, (DWORD)200));
+
+            // Check if iact process has actually exited
+            if (WaitForSingleObject(iact_exit_ev, 0) == WAIT_OBJECT_0) {
+                DWORD ec = 0;
+                GetExitCodeProcess(p_iact.proc, &ec);
+                if (ec != 0) {
+                    // Abnormal exit: solution is blocked waiting for a reply.
+                    // Kill it immediately so we don't hang.
+                    iact_exited = true;
+                    TerminateProcess(p_sol.proc, 1);
+                    CloseH(sol_stdin_p.w);
+                    CloseH(iact_stdin_p.w);
+                    break;
+                }
+                // ec == 0 (FOUND): let sol finish normally.
+            }
 
             while (true) {
                 Msg m;
@@ -330,32 +357,39 @@ private:
                 if (m.eof) { eof_count++; continue; }
 
                 std::string text = rtrim(m.line);
-
                 if (m.src == 0) {
-                    // sol → iact
                     push("output", text);
-                    DWORD wr;
-                    WriteFile(iact_stdin_p.w, m.line.c_str(), (DWORD)m.line.size(), &wr, nullptr);
+                    if (iact_stdin_p.w != INVALID_HANDLE_VALUE) {
+                        DWORD wr;
+                        WriteFile(iact_stdin_p.w, m.line.c_str(), (DWORD)m.line.size(), &wr, nullptr);
+                    }
                 } else {
-                    // iact → sol
                     push("input", text);
-                    DWORD wr;
-                    WriteFile(sol_stdin_p.w, m.line.c_str(), (DWORD)m.line.size(), &wr, nullptr);
+                    if (sol_stdin_p.w != INVALID_HANDLE_VALUE) {
+                        DWORD wr;
+                        WriteFile(sol_stdin_p.w, m.line.c_str(), (DWORD)m.line.size(), &wr, nullptr);
+                    }
                 }
             }
         }
 
+        // ── terminate straggler processes ────────────────────────────────
         if (timed_out || kill_flag) {
             TerminateProcess(p_sol.proc,  1);
             TerminateProcess(p_iact.proc, 1);
         }
+        // iact_exited already killed sol; ensure iact is also dead
+        if (iact_exited) {
+            TerminateProcess(p_iact.proc, 1);
+        }
 
-        // close write ends so processes see EOF
         CloseH(sol_stdin_p.w);
         CloseH(iact_stdin_p.w);
 
+        t_iact_watch.join();
         t_sol_r.join();
         t_iact_r.join();
+        CloseHandle(iact_exit_ev);
 
         // drain remaining messages
         {
@@ -391,7 +425,7 @@ private:
         t_ierr.join(); t_serr.join();
 
         if (timed_out) {
-            push("error", "실행 시간 초과 (30초)");
+            push("error", "실행 시간 초과 (" + std::to_string(timeout_sec) + "초)");
         } else if (rc == 0) {
             int q = 0;
             { std::lock_guard<std::mutex> lk(steps_mtx);
@@ -813,6 +847,21 @@ struct MainWnd {
     std::vector<Step> last_steps;
     std::string last_secret, last_interp_name;
 
+    // ── time limit ────────────────────────────────────────────────────────
+    HWND  tl_edit  = nullptr;   // numeric edit for seconds
+    HWND  tl_lbl   = nullptr;   // "초" label next to it
+    int   time_limit_sec = 10;  // default
+
+    int GetTimeLimitSec() {
+        if (!tl_edit) return time_limit_sec;
+        std::wstring txt = GetEditText(tl_edit);
+        try {
+            int v = std::stoi(txt);
+            if (v >= 1 && v <= 3600) return v;
+        } catch (...) {}
+        return time_limit_sec;
+    }
+
     // ── autosave ─────────────────────────────────────────────────────────
     static constexpr UINT_PTR TIMER_AUTOSAVE = 1;
     bool autosave_pending = false;
@@ -829,14 +878,17 @@ struct MainWnd {
     }
     void DoAutosave() {
         KillTimer(hw, TIMER_AUTOSAVE);
-        WriteUtf8File(AutosavePath(L"autosave_solution.py"),    w2s(GetEditText(sol_edit)));
-        WriteUtf8File(AutosavePath(L"autosave_interactor.py"),  w2s(GetEditText(iact_edit)));
+        WriteUtf8File(AutosavePath(L"autosave_solution.py"),   w2s(GetEditText(sol_edit)));
+        WriteUtf8File(AutosavePath(L"autosave_interactor.py"), w2s(GetEditText(iact_edit)));
+        WriteUtf8File(AutosavePath(L"autosave_secret.txt"),    w2s(GetEditText(sec_edit)));
     }
     void LoadAutosave() {
-        auto sol  = ReadUtf8File(AutosavePath(L"autosave_solution.py"));
-        auto iact = ReadUtf8File(AutosavePath(L"autosave_interactor.py"));
-        if (!sol.empty())  SetWindowTextW(sol_edit,  s2w(sol).c_str());
-        if (!iact.empty()) SetWindowTextW(iact_edit, s2w(iact).c_str());
+        auto sol    = ReadUtf8File(AutosavePath(L"autosave_solution.py"));
+        auto iact   = ReadUtf8File(AutosavePath(L"autosave_interactor.py"));
+        auto secret = ReadUtf8File(AutosavePath(L"autosave_secret.txt"));
+        if (!sol.empty())    SetWindowTextW(sol_edit,  s2w(sol).c_str());
+        if (!iact.empty())   SetWindowTextW(iact_edit, s2w(iact).c_str());
+        if (!secret.empty()) SetWindowTextW(sec_edit,  s2w(secret).c_str());
     }
 
     // ── status dot ───────────────────────────────────────────────────────
@@ -890,10 +942,11 @@ struct MainWnd {
         last_interp_name  = w2s(PathFindFileNameW(interp_path.c_str()));
 
         engine = std::make_unique<Engine>();
-        engine->interp    = interp_path;
-        engine->sol_code  = sol;
-        engine->iact_code = iact;
-        engine->secret    = secret;
+        engine->interp       = interp_path;
+        engine->sol_code     = sol;
+        engine->iact_code    = iact;
+        engine->secret       = secret;
+        engine->timeout_sec  = GetTimeLimitSec();
 
         engine->on_step = [this]{
             PostMessageW(hw, WM_ENGINE_STEP, 0, 0);
@@ -1010,6 +1063,17 @@ struct MainWnd {
         // splitter
         MoveWindow(splitter_hw, sb_x, y, SIDEBAR_W, SPLITTER_H, TRUE);
         y += SPLITTER_H + 8;
+
+        // time limit row (label + edit + "초")
+        {
+            int tl_y = y;
+            // "시간 제한:" label is drawn in DrawSidebar; place controls here
+            int edit_w = 44, lbl_w = 20;
+            int row_right = sb_x + SIDEBAR_W - PAD;
+            MoveWindow(tl_lbl,  row_right - lbl_w,         tl_y+2, lbl_w,   20, TRUE);
+            MoveWindow(tl_edit, row_right - lbl_w - 4 - edit_w, tl_y+2, edit_w, 20, TRUE);
+        }
+        y += 26;
 
         // run btn
         MoveWindow(run_btn->hw, sb_x+PAD, y, SIDEBAR_W-PAD*2, BTN_RUN_H, TRUE);
@@ -1168,7 +1232,7 @@ struct MainWnd {
             UINT notif = HIWORD(wp);
             HWND ctrl  = (HWND)lp;
             if (notif == EN_CHANGE &&
-                (ctrl == wnd->sol_edit || ctrl == wnd->iact_edit))
+                (ctrl == wnd->sol_edit || ctrl == wnd->iact_edit || ctrl == wnd->sec_edit))
                 wnd->ScheduleAutosave();
             break;
         }
@@ -1253,7 +1317,14 @@ struct MainWnd {
         DrawTextW(dc,L"비밀 시나리오 (sys.argv[1])",-1,&sl,DT_LEFT|DT_VCENTER|DT_SINGLELINE);
 
         // positions mirroring Layout()
-        int y = body_y + 28 + sec_h + SPLITTER_H + 8 + BTN_RUN_H + 6 + BTN_EXP_H + 10;
+        int y = body_y + 28 + sec_h + SPLITTER_H + 8;
+
+        // time limit label
+        SelectObject(dc, g_fontUI); SetTextColor(dc, COL_TEXT3);
+        RECT tlr{sb_x+PAD, y+4, W-100, y+22};
+        DrawTextW(dc, L"시간 제한:", -1, &tlr, DT_LEFT|DT_VCENTER|DT_SINGLELINE);
+
+        y += 26 + BTN_RUN_H + 6 + BTN_EXP_H + 10;
 
         hdiv(y);  // above trace header
 
@@ -1300,6 +1371,20 @@ struct MainWnd {
         // subclass secret edit too (Ctrl+A)
         SetWindowLongPtrW(sec_edit, GWLP_WNDPROC, (LONG_PTR)EditSubclass);
         SetWindowTextW(sec_edit, L"15");
+
+        // time limit controls
+        tl_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"10",
+            WS_CHILD|WS_VISIBLE|ES_NUMBER|ES_CENTER,
+            0,0,0,0, hw, nullptr, inst, nullptr);
+        SendMessageW(tl_edit, WM_SETFONT, (WPARAM)g_fontCode, TRUE);
+        SendMessageW(tl_edit, EM_SETBKGNDCOLOR, 0, COL_BG3);
+        SendMessageW(tl_edit, EM_SETLIMITTEXT, 4, 0);  // max 4 digits
+        SetWindowLongPtrW(tl_edit, GWLP_WNDPROC, (LONG_PTR)EditSubclass);
+
+        tl_lbl = CreateWindowExW(0, L"STATIC", L"초",
+            WS_CHILD|WS_VISIBLE|SS_LEFT,
+            0,0,0,0, hw, nullptr, inst, nullptr);
+        SendMessageW(tl_lbl, WM_SETFONT, (WPARAM)g_fontUI, TRUE);
 
         // splitter between secret and buttons
         splitter_hw = CreateWindowExW(0, L"STATIC", nullptr,
