@@ -10,4 +10,4 @@
 
 예시 문제: [#3006번 · 수 맞히기 (업다운)](http://10.122.0.73:8080/problems/3006)
 
-<img width="1917" height="1020" alt="Image" src="https://github.com/user-attachments/assets/f58674c8-3497-485a-bc9c-47aed1bce6f0" />
+<img width="1917" height="1020" alt="Image" src="https://github.com/user-attachments/assets/0bee4afb-0b20-40f7-b524-2a587ddcce36" />
